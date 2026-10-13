@@ -1,0 +1,100 @@
+name: Build and test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24", "1.25"]
+    env:
+      # http2's tests are synctest-based: built on go1.25, or on go1.24 with
+      # the synctest experiment (http2/synctest_go124_test.go).
+      GOEXPERIMENT: ${{ matrix.go == '1.24' && 'synctest' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Go version
+        run: go version && go env
+
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pack the module zip from a copy of the tree without this CI workflow,
+          # using golang.org/x/mod/zip (the proxy's own zip implementation).
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/zipper" dist
+          rsync -a --exclude .git --exclude .github --exclude dist ./ "$RUNNER_TEMP/modsrc/"
+          cd "$RUNNER_TEMP/zipper"
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.27.0
+          go run . golang.org/x/net v0.45.0 "$RUNNER_TEMP/modsrc" "$GITHUB_WORKSPACE/dist/v0.45.0.zip"
+          unzip -l "$GITHUB_WORKSPACE/dist/v0.45.0.zip" | tail -1
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test
+        shell: bash
+        run: |
+          set +e
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "$FILTER" ]; then
+            RUN_ARGS=(-run "^($(echo $FILTER | tr ' ' '|'))\$")
+          else
+            RUN_ARGS=()
+          fi
+          go test -v "${RUN_ARGS[@]}" ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+          status=${PIPESTATUS[0]}
+          echo "================ Test summary ================"
+          echo "Tests passed:  $(grep -cE '^[[:space:]]*--- PASS' "$RUNNER_TEMP/test.log")"
+          echo "Tests failed:  $(grep -cE '^[[:space:]]*--- FAIL' "$RUNNER_TEMP/test.log")"
+          echo "Tests skipped: $(grep -cE '^[[:space:]]*--- SKIP' "$RUNNER_TEMP/test.log")"
+          echo "Packages ok:   $(grep -cE '^ok[[:space:]]' "$RUNNER_TEMP/test.log")"
+          echo "Packages FAIL: $(grep -cE '^FAIL[[:space:]]' "$RUNNER_TEMP/test.log")"
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.go == '1.25'
+        with:
+          name: go-module-zip
+          path: dist/v0.45.0.zip
+          if-no-files-found: error
